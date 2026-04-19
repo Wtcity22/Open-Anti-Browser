@@ -23,7 +23,13 @@ from .services.extensions import (
     remove_extension_storage,
 )
 from .services.firefox import launch_firefox_profile
-from .services.network import kill_process_tree, proxy_to_profile_proxy, resolve_geo_profile, slugify
+from .services.network import (
+    kill_process_tree,
+    proxy_to_profile_proxy,
+    resolve_geo_profile,
+    slugify,
+    test_proxy_connectivity,
+)
 from .storage import JsonStorage
 
 
@@ -219,12 +225,18 @@ class BrowserManager:
 
     def test_proxy(self, payload: dict[str, Any]) -> dict[str, Any]:
         proxy_config = proxy_to_profile_proxy(payload)
-        geo = resolve_geo_profile(proxy_config, True, strict=proxy_config is not None)
-        ok = bool(geo.get("ip")) or proxy_config is None
+        connect_result = test_proxy_connectivity(proxy_config)
+        if not connect_result["ok"]:
+            return {
+                "ok": False,
+                "message": connect_result["message"],
+                "data": dict(connect_result),
+            }
+
         return {
-            "ok": ok,
-            "message": "连接成功" if ok else "没有解析到出口 IP",
-            "data": geo,
+            "ok": True,
+            "message": "连接成功",
+            "data": connect_result,
         }
 
     def list_saved_proxies(self) -> list[dict[str, Any]]:

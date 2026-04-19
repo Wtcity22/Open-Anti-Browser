@@ -1412,6 +1412,43 @@ html.dark .el-table .el-table__row:hover > td.el-table__cell {
   box-shadow: var(--oab-shadow-lg) !important;
 }
 
+.first-use-notice-box .el-message-box__content {
+  padding-top: 6px;
+}
+
+.first-use-notice {
+  color: var(--oab-text);
+  line-height: 1.75;
+  font-size: 14px;
+}
+
+.first-use-notice .notice-paragraph {
+  margin: 0 0 10px;
+  font-weight: 600;
+}
+
+.first-use-notice ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.first-use-notice li {
+  margin-bottom: 8px;
+}
+
+.first-use-notice li:last-child {
+  margin-bottom: 0;
+}
+
+.first-use-notice .notice-line {
+  line-height: 1.65;
+}
+
+.first-use-notice .notice-line-en {
+  color: var(--oab-muted);
+  font-size: 13px;
+}
+
 /* ─── Input Append Button (iOS Style) ──────────────── */
 
 .el-input-group {

@@ -7,6 +7,7 @@ import select
 import shutil
 import socket
 import ssl
+import struct
 import threading
 import time
 from pathlib import Path
@@ -23,6 +24,9 @@ from curl_cffi import requests
 
 DEFAULT_HTTP_TIMEOUT = 8
 GEO_PRIMARY_TIMEOUT = 4.5
+PROXY_CONNECT_TIMEOUT = 6
+PROXY_TEST_TARGET_HOST = "1.1.1.1"
+PROXY_TEST_TARGET_PORT = 443
 DEFAULT_GEO_PROFILE = {
     "ip": None,
     "language": "en-US",
@@ -62,9 +66,15 @@ BROWSERSCAN_HEADERS = {
 
 
 def create_http_session(proxy_url: str | None = None, timeout: float = DEFAULT_HTTP_TIMEOUT) -> requests.Session:
+    proxies = None
+    if proxy_url:
+        proxies = {
+            "http": proxy_url,
+            "https": proxy_url,
+        }
     return requests.Session(
         impersonate="chrome136",
-        proxy=proxy_url,
+        proxies=proxies,
         verify=False,
         timeout=timeout,
     )
@@ -110,12 +120,13 @@ def normalize_proxy_config(proxy: Any) -> dict[str, Any] | None:
     password = parsed_url.password or password
     ip_port = f"{parsed_url.hostname}:{parsed_url.port}"
     browser_proxy = f"{scheme}://{ip_port}"
+    request_scheme = "socks5h" if scheme == "socks5" else scheme
 
     if username is not None and str(username) != "":
         auth = f"{quote(str(username), safe='')}:{quote(str(password or ''), safe='')}@"
-        request_proxy = f"{scheme}://{auth}{ip_port}"
+        request_proxy = f"{request_scheme}://{auth}{ip_port}"
     else:
-        request_proxy = browser_proxy
+        request_proxy = f"{request_scheme}://{ip_port}"
         username = None
         password = None
 
@@ -398,7 +409,8 @@ def resolve_geo_profile(
     if not auto_timezone:
         return geo_profile
 
-    session = create_http_session(proxy["request_proxy"] if proxy else None)
+    request_proxy = proxy["request_proxy"] if proxy else None
+    session = create_http_session(request_proxy)
     error_message: str | None = None
     try:
         try:
@@ -443,6 +455,35 @@ def resolve_geo_profile(
     return geo_profile
 
 
+def test_proxy_connectivity(proxy: dict[str, Any] | None) -> dict[str, Any]:
+    if not proxy:
+        return {
+            "ok": True,
+            "message": "未设置代理，当前为直连",
+            "latency_ms": 0,
+        }
+
+    scheme = str(proxy.get("scheme") or "").lower()
+    started_at = time.perf_counter()
+    try:
+        if scheme == "socks5":
+            _test_socks5_proxy_connectivity(proxy)
+        else:
+            _test_http_proxy_connectivity(proxy)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "message": f"代理握手失败：{exc}",
+            "latency_ms": int((time.perf_counter() - started_at) * 1000),
+        }
+
+    return {
+        "ok": True,
+        "message": "代理握手成功",
+        "latency_ms": int((time.perf_counter() - started_at) * 1000),
+    }
+
+
 def _merge_geo_profile(profile: dict[str, Any], ip_value: str | None, ip_data: dict[str, Any]) -> None:
     if ip_value:
         profile["ip"] = ip_value
@@ -473,6 +514,104 @@ def _merge_geo_profile(profile: dict[str, Any], ip_value: str | None, ip_data: d
         profile["timezone"] = timezone_name or auto_timezone
     elif timezone_name:
         profile["timezone"] = timezone_name
+
+
+def _test_socks5_proxy_connectivity(proxy: dict[str, Any]) -> None:
+    username = str(proxy.get("username") or "")
+    password = str(proxy.get("password") or "")
+    auth_methods = [0x00, 0x02] if username else [0x00]
+
+    with socket.create_connection((proxy["host"], int(proxy["port"])), timeout=PROXY_CONNECT_TIMEOUT) as sock:
+        sock.settimeout(PROXY_CONNECT_TIMEOUT)
+        sock.sendall(bytes([0x05, len(auth_methods), *auth_methods]))
+        greeting = _recv_exact(sock, 2)
+        if greeting[0] != 0x05:
+            raise RuntimeError("SOCKS5 服务响应异常")
+        if greeting[1] == 0xFF:
+            raise RuntimeError("SOCKS5 服务不接受当前认证方式")
+
+        if greeting[1] == 0x02:
+            user_bytes = username.encode("utf-8")
+            password_bytes = password.encode("utf-8")
+            if len(user_bytes) > 255 or len(password_bytes) > 255:
+                raise RuntimeError("SOCKS5 账号或密码长度超限")
+            sock.sendall(
+                bytes([0x01, len(user_bytes)]) + user_bytes + bytes([len(password_bytes)]) + password_bytes
+            )
+            auth_result = _recv_exact(sock, 2)
+            if auth_result[1] != 0x00:
+                raise RuntimeError("SOCKS5 账号或密码错误")
+
+        sock.sendall(
+            bytes([0x05, 0x01, 0x00, 0x01])
+            + socket.inet_aton(PROXY_TEST_TARGET_HOST)
+            + struct.pack("!H", PROXY_TEST_TARGET_PORT)
+        )
+        response = _recv_exact(sock, 10)
+        if response[1] != 0x00:
+            raise RuntimeError(f"SOCKS5 连接失败，错误码 {response[1]}")
+
+
+def _test_http_proxy_connectivity(proxy: dict[str, Any]) -> None:
+    host = str(proxy.get("host") or "")
+    port = int(proxy.get("port") or 0)
+    if not host or not port:
+        raise RuntimeError("代理地址不完整")
+
+    username = str(proxy.get("username") or "")
+    password = str(proxy.get("password") or "")
+
+    raw_socket = socket.create_connection((host, port), timeout=PROXY_CONNECT_TIMEOUT)
+    try:
+        raw_socket.settimeout(PROXY_CONNECT_TIMEOUT)
+        sock: socket.socket = raw_socket
+        if str(proxy.get("scheme") or "").lower() == "https":
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(raw_socket, server_hostname=host)
+
+        headers = [
+            f"CONNECT {PROXY_TEST_TARGET_HOST}:{PROXY_TEST_TARGET_PORT} HTTP/1.1",
+            f"Host: {PROXY_TEST_TARGET_HOST}:{PROXY_TEST_TARGET_PORT}",
+            "Proxy-Connection: keep-alive",
+            "Connection: keep-alive",
+        ]
+        if username:
+            token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+            headers.append(f"Proxy-Authorization: Basic {token}")
+        headers.append("")
+        headers.append("")
+        sock.sendall("\r\n".join(headers).encode("iso-8859-1"))
+        response = _recv_until(sock, b"\r\n\r\n")
+        first_line = response.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="ignore")
+        if " 200 " not in first_line:
+            raise RuntimeError(first_line or "HTTP 代理握手失败")
+    finally:
+        try:
+            raw_socket.close()
+        except Exception:
+            pass
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise RuntimeError("代理连接被提前关闭")
+        data += chunk
+    return data
+
+
+def _recv_until(sock: socket.socket, marker: bytes, max_size: int = 65536) -> bytes:
+    data = b""
+    while marker not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) >= max_size:
+            break
+    return data
 
 
 def slugify(value: str, fallback: str = "profile") -> str:

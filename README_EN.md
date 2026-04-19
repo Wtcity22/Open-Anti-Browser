@@ -147,57 +147,11 @@ After Chrome starts, use the returned local debug port with Patchright through C
 
 After Firefox starts, use the returned port with RuyiPage
 
-## Run from source
+## Source code and build
 
-### Requirements
-
-- Windows
-- Python 3.12 or newer
-- Node.js 20 or newer
-- npm
-- PowerShell 5.1 or newer
-
-### Prepare source code
-
-```powershell
-git clone git@github.com:Wtcity22/Open-Anti-Browser.git
-cd Open-Anti-Browser
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-cd frontend
-npm install
-cd ..
-```
-
-### Prepare browser engines
-
-The source repository does not include large engine binaries
-
-Before packaging, prepare these local engine directories
-
-- `engines\chrome\chrome.exe` with the full Chromium engine directory
-- `engines\firefox\firefox.exe` with the full Firefox engine directory
-
-You can obtain the matching versions from the engine source projects listed above
-
-### Run locally
-
-```powershell
-python .\launch_app.py
-```
-
-## Build installer
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build_installer.ps1
-```
-
-The installer will be generated here
-
-```text
-dist\installer\Open-Anti-Browser-Setup.exe
-```
+- The source code is publicly available
+- To reduce commercial abuse, this README does not include ready-to-run build steps
+- If you want to study the build flow, please review the source tree and build scripts on your own
 
 ## Notes
 
@@ -208,6 +162,7 @@ dist\installer\Open-Anti-Browser-Setup.exe
 
 ## Usage boundaries
 
+- This is an open-source project and it is not sold as a paid product
 - This project is intended for local development, automation debugging, testing, and compliant research
 - Do not use this project for illegal activity, unauthorized access, platform abuse, or infringement
 - Users are responsible for following local laws and the rules of any platform they interact with

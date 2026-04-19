@@ -8,7 +8,7 @@
           </div>
           <div>
             <div class="logo-text">Open-Anti-Browser</div>
-            <div class="logo-subtitle">Fingerprint Browser</div>
+            <div class="logo-subtitle">{{ sidebarSubtitle }}</div>
           </div>
         </div>
       </div>
@@ -150,7 +150,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Monitor,
   FolderOpened,
@@ -174,9 +174,11 @@ import AppSettings from './components/AppSettings.vue'
 import ApiAccess from './components/ApiAccess.vue'
 import ApiDocs from './components/ApiDocs.vue'
 import { getLocale, setLocale } from './i18n/index.js'
+import { getOpenSourceNotice, getOpenSourceSidebarSubtitle, getOpenSourceWindowTitle } from './lib/openSourceNotice.js'
 
 const { t } = useI18n()
 const store = useProfileStore()
+const FIRST_USE_NOTICE_KEY = 'oab:first-use-notice:v2'
 
 const validNavKeys = new Set(['profiles', 'groups', 'proxies', 'extensions', 'apiAccess', 'apiDocs', 'settings'])
 const activeNav = ref(resolveInitialNav())
@@ -207,6 +209,7 @@ const themeMode = computed(() => store.settings?.theme_mode || 'system')
 const themeLabel = computed(() => t(`theme.${themeMode.value}`))
 const languageCode = computed(() => store.settings?.language || getLocale())
 const languageLabel = computed(() => t(languageCode.value === 'en-US' ? 'language.enUS' : 'language.zhCN'))
+const sidebarSubtitle = computed(() => getOpenSourceSidebarSubtitle(languageCode.value))
 const themeIcon = computed(() => {
   if (themeMode.value === 'dark') return Moon
   if (themeMode.value === 'light') return Sunny
@@ -244,7 +247,11 @@ watch(
 
 watch(
   () => store.settings?.language,
-  value => setLocale(value || getLocale()),
+  value => {
+    const locale = value || getLocale()
+    setLocale(locale)
+    document.title = getOpenSourceWindowTitle(locale)
+  },
   { immediate: true },
 )
 
@@ -277,6 +284,7 @@ onMounted(async () => {
 
     await store.bootstrap()
     await store.getBackendModeStatus()
+    await showFirstUseNoticeIfNeeded()
 
     profileRefreshTimer = window.setInterval(async () => {
       if (document.hidden) return
@@ -438,5 +446,37 @@ function syncViewQuery(view) {
     url.searchParams.set('view', view)
   }
   window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+}
+
+async function showFirstUseNoticeIfNeeded() {
+  if (localStorage.getItem(FIRST_USE_NOTICE_KEY) === '1') {
+    return
+  }
+  const notice = getOpenSourceNotice(languageCode.value)
+  const html = `
+    <div class="first-use-notice">
+      <div class="notice-paragraph">
+        <div class="notice-line notice-line-zh">${notice.introZh}</div>
+        <div class="notice-line notice-line-en">${notice.introEn}</div>
+      </div>
+      <ul>
+        ${notice.pairs.map(item => `
+          <li>
+            <div class="notice-line notice-line-zh">${item.zh}</div>
+            <div class="notice-line notice-line-en">${item.en}</div>
+          </li>
+        `).join('')}
+      </ul>
+    </div>
+  `
+  await ElMessageBox.alert(html, notice.title, {
+    confirmButtonText: notice.confirmText,
+    dangerouslyUseHTMLString: true,
+    closeOnClickModal: false,
+    closeOnPressEscape: false,
+    showClose: false,
+    customClass: 'first-use-notice-box',
+  })
+  localStorage.setItem(FIRST_USE_NOTICE_KEY, '1')
 }
 </script>

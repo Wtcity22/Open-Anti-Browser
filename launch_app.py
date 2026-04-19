@@ -18,7 +18,7 @@ from backend.runtime_control import clear_backend_only_state, find_available_por
 from backend.ui_bridge import register_directory_picker_callback, register_exit_callback
 
 
-APP_TITLE = "Open-Anti-Browser"
+APP_TITLE = "Open-Anti-Browser · 开源指纹浏览器"
 
 
 def find_available_port(preferred: int = 8000, span: int = 20) -> int:

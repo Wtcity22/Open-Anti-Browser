@@ -1,5 +1,5 @@
 #define MyAppName "Open-Anti-Browser"
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.1.2"
 #define MyAppPublisher "Open-Anti-Browser"
 #define MyAppExeName "Open-Anti-Browser.exe"
 #define MyAppAssocName MyAppName + " Desktop App"
