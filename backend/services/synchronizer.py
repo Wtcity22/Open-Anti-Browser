@@ -11,9 +11,17 @@ from typing import Any, Callable
 
 import websocket
 
+try:
+    from ruyipage import FirefoxOptions, FirefoxPage
+except Exception:  # pragma: no cover - only used when Firefox synchronizer starts
+    FirefoxOptions = None
+    FirefoxPage = None
+
 
 SYNC_EVENT_PREFIX = "__OAB_SYNC__"
 SYNC_HEARTBEAT_SECONDS = 1.2
+SYNC_FIREFOX_POLL_SECONDS = 0.035
+SYNC_CLICK_NEW_TAB_DEFER_SECONDS = 1.5
 SYNC_DISCOVERY_TIMEOUT = 5
 SYNC_COMMAND_TIMEOUT = 6
 SYNC_WORKER_QUEUE_LIMIT = 280
@@ -25,12 +33,15 @@ MASTER_INJECT_SCRIPT = r"""
   }
 
   const prefix = '__OAB_SYNC__';
+  window.__oabSyncQueue = Array.isArray(window.__oabSyncQueue) ? window.__oabSyncQueue : [];
+  window.__oabSyncDrain = () => window.__oabSyncQueue.splice(0, window.__oabSyncQueue.length);
   const state = {
     lastLocation: location.href,
     inputTimer: null,
     moveFrame: null,
     movePayload: null,
     scrollTimer: null,
+    wheelCalibrateTimer: null,
     wheelFrame: null,
     wheelPayload: null,
     lastWheelAt: 0,
@@ -105,12 +116,21 @@ MASTER_INJECT_SCRIPT = r"""
   };
 
   const emit = (type, payload) => {
-    const body = JSON.stringify({
+    const event = {
       type,
       payload,
       href: location.href,
       ts: Date.now(),
-    });
+    };
+    const body = JSON.stringify(event);
+    try {
+      window.__oabSyncQueue.push(body);
+      if (window.__oabSyncQueue.length > 220) {
+        window.__oabSyncQueue.splice(0, window.__oabSyncQueue.length - 220);
+      }
+    } catch (error) {
+      // ignore
+    }
     try {
       if (typeof window.__oabSyncBinding === 'function') {
         window.__oabSyncBinding(body);
@@ -254,6 +274,7 @@ MASTER_INJECT_SCRIPT = r"""
   document.addEventListener('wheel', (event) => {
     state.lastWheelAt = Date.now();
     state.suppressScrollUntil = state.lastWheelAt + 1500;
+    const wheelTarget = event.target && event.target.nodeType === 1 ? event.target : null;
     const nextPayload = {
       ...buildPoint(event),
       deltaX: Number(event.deltaX || 0),
@@ -278,6 +299,33 @@ MASTER_INJECT_SCRIPT = r"""
     } else {
       state.wheelPayload = nextPayload;
     }
+    window.clearTimeout(state.wheelCalibrateTimer);
+    state.wheelCalibrateTimer = window.setTimeout(() => {
+      const calibrationTarget = wheelTarget && wheelTarget.isConnected ? wheelTarget : null;
+      if (calibrationTarget && calibrationTarget !== document.body && calibrationTarget !== document.documentElement) {
+        const selector = buildSelector(calibrationTarget);
+        const maxY = Math.max(0, Number(calibrationTarget.scrollHeight || 0) - Number(calibrationTarget.clientHeight || 0));
+        const maxX = Math.max(0, Number(calibrationTarget.scrollWidth || 0) - Number(calibrationTarget.clientWidth || 0));
+        emit('scroll', {
+          source: 'wheel_calibrate',
+          mode: 'element',
+          selector,
+          scrollTop: Number(calibrationTarget.scrollTop || 0),
+          scrollLeft: Number(calibrationTarget.scrollLeft || 0),
+          ratioX: maxX > 0 ? Number(calibrationTarget.scrollLeft || 0) / maxX : 0,
+          ratioY: maxY > 0 ? Number(calibrationTarget.scrollTop || 0) / maxY : 0,
+        });
+        return;
+      }
+      emit('scroll', {
+        source: 'wheel_calibrate',
+        mode: 'window',
+        x: Number(window.scrollX || 0),
+        y: Number(window.scrollY || 0),
+        ratioX: maxScrollLeft() > 0 ? Number(window.scrollX || 0) / maxScrollLeft() : 0,
+        ratioY: maxScrollTop() > 0 ? Number(window.scrollY || 0) / maxScrollTop() : 0,
+      });
+    }, 280);
     if (state.wheelFrame) {
       return;
     }
@@ -331,6 +379,163 @@ MASTER_INJECT_SCRIPT = r"""
 
   window.__oabSyncInstalled = true;
   return 'installed';
+})();
+"""
+
+FOLLOWER_VISUAL_SCRIPT = r"""
+(() => {
+  if (window.__oabSyncVisual && window.__oabSyncVisual.version === 1) {
+    return true;
+  }
+
+  const rootId = '__oab-sync-visual-root';
+  const oldRoot = document.getElementById(rootId);
+  if (oldRoot) {
+    oldRoot.remove();
+  }
+
+  const root = document.createElement('div');
+  root.id = rootId;
+  root.style.cssText = [
+    'position:fixed',
+    'inset:0',
+    'z-index:2147483647',
+    'pointer-events:none',
+    'overflow:hidden',
+    'contain:layout style paint',
+  ].join(';');
+
+  const cursor = document.createElement('div');
+  cursor.style.cssText = [
+    'position:absolute',
+    'left:0',
+    'top:0',
+    'width:12px',
+    'height:12px',
+    'margin-left:-6px',
+    'margin-top:-6px',
+    'border-radius:999px',
+    'background:#0a84ff',
+    'border:2px solid rgba(255,255,255,.95)',
+    'box-shadow:0 0 0 3px rgba(10,132,255,.18),0 8px 20px rgba(0,0,0,.22)',
+    'opacity:0',
+    'transform:translate3d(-100px,-100px,0)',
+    'transition:opacity .18s ease',
+    'will-change:transform,opacity',
+  ].join(';');
+  root.appendChild(cursor);
+
+  const ensureRoot = () => {
+    if (!root.isConnected) {
+      (document.documentElement || document.body).appendChild(root);
+    }
+  };
+
+  const clamp = (value, max) => Math.max(0, Math.min(Math.round(Number(value || 0)), Math.max(0, max - 1)));
+  const state = {
+    x: -100,
+    y: -100,
+    visibleUntil: 0,
+    frame: 0,
+    trailCount: 0,
+  };
+
+  const render = () => {
+    state.frame = 0;
+    ensureRoot();
+    const now = Date.now();
+    cursor.style.opacity = now < state.visibleUntil ? '1' : '0';
+    cursor.style.transform = `translate3d(${state.x}px, ${state.y}px, 0)`;
+    if (now < state.visibleUntil) {
+      state.frame = requestAnimationFrame(render);
+    }
+  };
+
+  const show = (x, y) => {
+    state.x = clamp(x, window.innerWidth);
+    state.y = clamp(y, window.innerHeight);
+    state.visibleUntil = Date.now() + 900;
+    if (!state.frame) {
+      state.frame = requestAnimationFrame(render);
+    }
+  };
+
+  const trail = (x, y) => {
+    ensureRoot();
+    const dot = document.createElement('div');
+    const size = Math.max(5, 10 - Math.min(4, state.trailCount % 5));
+    dot.style.cssText = [
+      'position:absolute',
+      `left:${clamp(x, window.innerWidth)}px`,
+      `top:${clamp(y, window.innerHeight)}px`,
+      `width:${size}px`,
+      `height:${size}px`,
+      `margin-left:${-size / 2}px`,
+      `margin-top:${-size / 2}px`,
+      'border-radius:999px',
+      'background:rgba(10,132,255,.26)',
+      'transform:translate3d(0,0,0) scale(1)',
+      'opacity:.92',
+      'transition:opacity .38s ease, transform .38s ease',
+      'will-change:opacity,transform',
+    ].join(';');
+    root.appendChild(dot);
+    state.trailCount += 1;
+    requestAnimationFrame(() => {
+      dot.style.opacity = '0';
+      dot.style.transform = 'translate3d(0,0,0) scale(.3)';
+    });
+    window.setTimeout(() => dot.remove(), 440);
+  };
+
+  const pulse = (x, y, color = '10,132,255') => {
+    ensureRoot();
+    const ring = document.createElement('div');
+    ring.style.cssText = [
+      'position:absolute',
+      `left:${clamp(x, window.innerWidth)}px`,
+      `top:${clamp(y, window.innerHeight)}px`,
+      'width:14px',
+      'height:14px',
+      'margin-left:-7px',
+      'margin-top:-7px',
+      'border-radius:999px',
+      `border:2px solid rgba(${color},.62)`,
+      `background:rgba(${color},.08)`,
+      'opacity:.95',
+      'transform:scale(.55)',
+      'transition:opacity .42s ease, transform .42s ease',
+      'will-change:opacity,transform',
+    ].join(';');
+    root.appendChild(ring);
+    requestAnimationFrame(() => {
+      ring.style.opacity = '0';
+      ring.style.transform = 'scale(3.1)';
+    });
+    window.setTimeout(() => ring.remove(), 500);
+  };
+
+  window.__oabSyncVisual = {
+    version: 1,
+    move(x, y) {
+      show(x, y);
+      trail(x, y);
+      return true;
+    },
+    click(x, y) {
+      show(x, y);
+      pulse(x, y);
+      return true;
+    },
+    wheel(x, y) {
+      show(x, y);
+      pulse(x, y, '142,142,147');
+      return true;
+    },
+  };
+
+  ensureRoot();
+  return true;
 })();
 """
 
@@ -641,12 +846,453 @@ class CdpPageClient:
         self.close()
 
 
+class RuyiFirefoxPageClient:
+    def __init__(
+        self,
+        profile_id: str,
+        port: int,
+        event_handler: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.profile_id = profile_id
+        self.port = int(port)
+        self._event_handler = event_handler
+        self._lock = threading.RLock()
+        self._command_lock = threading.RLock()
+        self._page: Any = None
+        self._browser: Any = None
+        self._connected = False
+        self._last_error = ""
+        self._target: dict[str, Any] = {}
+        self._last_seen_at: str | None = None
+        self._pressed_button: int | None = None
+        self._visual_target_id = ""
+        self._visual_ready_at = 0.0
+
+    @property
+    def is_connected(self) -> bool:
+        with self._lock:
+            driver = getattr(self._browser, "driver", None)
+            return bool(self._connected and self._page and driver and getattr(driver, "_is_running", True))
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "profile_id": self.profile_id,
+                "port": self.port,
+                "connected": self.is_connected,
+                "target_id": self._target.get("id") or "",
+                "target_url": self._target.get("url") or "",
+                "target_title": self._target.get("title") or "",
+                "last_seen_at": self._last_seen_at,
+                "last_error": self._last_error,
+            }
+
+    def current_target_id(self) -> str:
+        with self._lock:
+            if self._page is not None:
+                return str(getattr(self._page, "tab_id", "") or self._target.get("id") or "")
+            return str(self._target.get("id") or "")
+
+    def connect(self, target_id: str | None = None) -> None:
+        if FirefoxOptions is None or FirefoxPage is None:
+            raise RuntimeError("Firefox 同步需要安装 ruyipage")
+        self.close()
+        opts = FirefoxOptions()
+        opts.set_address(f"127.0.0.1:{self.port}")
+        opts.existing_only(True)
+        try:
+            opts.set_retry(8, 0.35)
+        except Exception:
+            pass
+        page = FirefoxPage(opts)
+        browser = getattr(page, "_firefox", None)
+        if browser is None:
+            raise RuntimeError(f"{self.profile_id} Firefox BiDi 连接不可用")
+        with self._lock:
+            self._browser = browser
+            self._page = page
+            self._connected = True
+            self._last_error = ""
+        wanted = str(target_id or "").strip()
+        if wanted:
+            self.switch_target(wanted)
+        else:
+            self.sync_to_current_target()
+        self._mark_seen()
+
+    def close(self) -> None:
+        with self._lock:
+            browser = self._browser
+            self._browser = None
+            self._page = None
+            self._connected = False
+            self._visual_target_id = ""
+            self._visual_ready_at = 0.0
+        if not browser:
+            return
+        try:
+            driver = getattr(browser, "driver", None)
+            if driver:
+                driver.stop()
+        except Exception:
+            pass
+        try:
+            from ruyipage._base.browser import Firefox
+            from ruyipage._pages.firefox_page import FirefoxPage as RuyiFirefoxPage
+
+            with Firefox._lock:
+                Firefox._BROWSERS.pop(getattr(browser, "address", ""), None)
+            RuyiFirefoxPage._PAGES.pop(getattr(browser, "address", ""), None)
+            browser._initialized = False
+        except Exception:
+            pass
+
+    def refresh_target(self) -> None:
+        try:
+            targets = self.list_targets()
+        except Exception:
+            return
+        current = self.current_target_id()
+        target = next((item for item in targets if item.get("id") == current), None)
+        if not target and targets:
+            target = targets[0]
+        if target:
+            with self._lock:
+                previous_url = str(self._target.get("url") or "")
+                next_url = str(target.get("url") or previous_url or "")
+                self._target.update({
+                    "id": target.get("id") or current,
+                    "url": next_url,
+                    "title": target.get("title") or self._target.get("title") or "",
+                })
+                if next_url != previous_url:
+                    self._visual_target_id = ""
+                    self._visual_ready_at = 0.0
+
+    def sync_to_current_target(self) -> str:
+        targets = self.list_targets()
+        target_id = _active_target_id_from_targets(targets)
+        if not target_id and targets:
+            target_id = str(targets[0].get("id") or "")
+        if target_id and target_id != self.current_target_id():
+            self.switch_target(target_id)
+        return target_id or self.current_target_id()
+
+    def ensure_ready(self) -> None:
+        if self.is_connected:
+            return
+        self.connect()
+
+    def evaluate(self, expression: str) -> Any:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            self.ensure_ready()
+            with self._lock:
+                page = self._page
+            if page is None:
+                raise RuntimeError(f"{self.profile_id} Firefox 页面不可用")
+            try:
+                with self._command_lock:
+                    result = page.run_js(expression, as_expr=True, timeout=SYNC_COMMAND_TIMEOUT)
+                self._mark_seen()
+                return result
+            except Exception as exc:
+                last_error = exc
+                with self._lock:
+                    self._last_error = str(exc)
+                if attempt == 0 and _is_missing_browsing_context_error(exc):
+                    self._recover_current_target()
+                    continue
+                raise
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"{self.profile_id} Firefox 页面脚本执行失败")
+
+    def dispatch_mouse_event(self, payload: dict[str, Any], wait: bool = True) -> None:
+        self.ensure_ready()
+        event_type = str(payload.get("type") or "")
+        x = int(round(float(payload.get("x") or 0)))
+        y = int(round(float(payload.get("y") or 0)))
+        with self._lock:
+            page = self._page
+        if page is None:
+            return
+        actions = page.actions
+        if event_type == "mouseWheel":
+            delta_x = int(round(float(payload.get("deltaX") or 0)))
+            delta_y = int(round(float(payload.get("deltaY") or 0)))
+            self._draw_visual("wheel", {"x": x, "y": y})
+            self.evaluate(_build_smooth_wheel_expression({**payload, "deltaX": delta_x, "deltaY": delta_y, "x": x, "y": y}))
+            return
+        if event_type == "mouseMoved":
+            self._draw_visual("move", {"x": x, "y": y})
+            with self._command_lock:
+                actions.move_to((x, y), duration=0).perform()
+            return
+        if event_type == "mousePressed":
+            self._pressed_button = _button_index(str(payload.get("button") or "left"))
+            return
+        if event_type == "mouseReleased":
+            button = self._pressed_button
+            self._pressed_button = None
+            self._draw_visual("click", {"x": x, "y": y})
+            with self._command_lock:
+                action = actions.move_to((x, y), duration=0)
+                if button == 2:
+                    action.right_click().perform()
+                elif button == 1:
+                    action.middle_click().perform()
+                else:
+                    action.click().perform()
+            return
+
+    def dispatch_key_event(self, payload: dict[str, Any]) -> None:
+        key = str(payload.get("key") or payload.get("text") or payload.get("unmodifiedText") or "")
+        if key:
+            self.ensure_ready()
+            with self._lock:
+                page = self._page
+            if page is not None:
+                with self._command_lock:
+                    page.actions.press(key).perform()
+
+    def insert_text(self, text: str) -> None:
+        self.ensure_ready()
+        with self._lock:
+            page = self._page
+        if page is not None and text:
+            with self._command_lock:
+                page.actions.type(str(text)).perform()
+
+    def create_target(self, url: str, background: bool = False) -> str:
+        self.ensure_ready()
+        with self._lock:
+            browser = self._browser
+        if browser is None:
+            raise RuntimeError(f"{self.profile_id} Firefox 浏览器不可用")
+        tab = browser.new_tab(url or None, background=bool(background))
+        target_id = str(getattr(tab, "tab_id", "") or "")
+        if not background and target_id:
+            self.switch_target(target_id)
+        return target_id
+
+    def close_target(self, target_id: str) -> None:
+        self.ensure_ready()
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            return
+        with self._lock:
+            browser = self._browser
+        if browser is None:
+            return
+        browser.close_tabs(target_id)
+        if self.current_target_id() == target_id:
+            targets = self.list_targets()
+            next_id = _active_target_id_from_targets(targets) or (str(targets[0].get("id") or "") if targets else "")
+            if next_id:
+                self.switch_target(next_id)
+
+    def activate_target(self, target_id: str) -> None:
+        self.ensure_ready()
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            return
+        with self._lock:
+            browser = self._browser
+        if browser is None:
+            return
+        browser.activate_tab(target_id)
+        self.switch_target(target_id)
+
+    def switch_target(self, target_id: str) -> bool:
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            return False
+        self.ensure_ready()
+        if self.current_target_id() == target_id and self._page is not None:
+            return False
+        with self._lock:
+            browser = self._browser
+        if browser is None:
+            return False
+        tab = browser.get_tab(target_id)
+        if not tab:
+            return False
+        with self._lock:
+            self._page = tab
+            self._target["id"] = target_id
+            self._visual_target_id = ""
+            self._visual_ready_at = 0.0
+        self.refresh_target()
+        return True
+
+    def list_targets(self) -> list[dict[str, Any]]:
+        self.ensure_ready()
+        with self._lock:
+            browser = self._browser
+        if browser is None:
+            return []
+        result: list[dict[str, Any]] = []
+        try:
+            tab_ids = list(browser.tab_ids)
+        except Exception:
+            tab_ids = []
+        for index, tab_id in enumerate(tab_ids):
+            tab = None
+            try:
+                tab = browser.get_tab(tab_id)
+            except Exception:
+                tab = None
+            url = ""
+            title = ""
+            active = False
+            if tab is not None:
+                try:
+                    url = str(tab.url or "")
+                except Exception:
+                    url = ""
+                try:
+                    title = str(tab.title or "")
+                except Exception:
+                    title = ""
+                try:
+                    active = bool(tab.run_js("document.hasFocus()", as_expr=True, timeout=1))
+                except Exception:
+                    active = False
+            result.append({
+                "id": str(tab_id),
+                "type": "page",
+                "url": url,
+                "title": title,
+                "active": active,
+                "index": index,
+            })
+        result.sort(key=lambda item: (0 if item.get("active") else 1, int(item.get("index") or 0)))
+        return result
+
+    def navigate(self, url: str) -> None:
+        self.ensure_ready()
+        with self._lock:
+            page = self._page
+        if page is None:
+            raise RuntimeError(f"{self.profile_id} Firefox 页面不可用")
+        with self._command_lock:
+            page.get(url, wait="interactive", timeout=SYNC_COMMAND_TIMEOUT)
+        with self._lock:
+            self._target["url"] = url
+            self._last_seen_at = _now_iso()
+            self._visual_target_id = ""
+            self._visual_ready_at = 0.0
+
+    def get_location(self) -> str:
+        value = self.evaluate("location.href")
+        if isinstance(value, str):
+            with self._lock:
+                self._target["url"] = value
+        return str(value or "")
+
+    def drain_events(self) -> list[dict[str, Any]]:
+        try:
+            values = self.evaluate("""
+(() => {
+  if (typeof window.__oabSyncDrain !== 'function') return [];
+  return window.__oabSyncDrain();
+})()
+""")
+        except Exception:
+            return []
+        if not isinstance(values, list):
+            return []
+        result: list[dict[str, Any]] = []
+        for item in values:
+            event = _decode_sync_event(item)
+            if event:
+                result.append(event)
+        return result
+
+    def _mark_seen(self) -> None:
+        with self._lock:
+            self._last_seen_at = _now_iso()
+
+    def _recover_current_target(self) -> None:
+        with self._lock:
+            browser = self._browser
+            current_id = str(self._target.get("id") or "")
+        if browser is None:
+            self.connect()
+            return
+
+        targets: list[dict[str, Any]] = []
+        try:
+            targets = self.list_targets()
+        except Exception:
+            targets = []
+
+        target_id = _active_target_id_from_targets(targets)
+        if not target_id and current_id:
+            if any(str(item.get("id") or "") == current_id for item in targets):
+                target_id = current_id
+        if not target_id and targets:
+            target_id = str(targets[0].get("id") or "")
+
+        if target_id:
+            try:
+                tab = browser.get_tab(target_id)
+            except Exception:
+                tab = None
+            if tab is not None:
+                with self._lock:
+                    self._page = tab
+                    self._target["id"] = target_id
+                    self._connected = True
+                    self._visual_target_id = ""
+                    self._visual_ready_at = 0.0
+                self.refresh_target()
+                return
+
+        with self._lock:
+            self._connected = False
+            self._page = None
+            self._visual_target_id = ""
+            self._visual_ready_at = 0.0
+        self.connect()
+
+    def _ensure_visual_overlay(self, force: bool = False) -> bool:
+        target_id = self.current_target_id()
+        now = time.monotonic()
+        with self._lock:
+            ready = self._visual_target_id == target_id and (now - self._visual_ready_at) < 2.0
+        if ready and not force:
+            return True
+        self.evaluate(FOLLOWER_VISUAL_SCRIPT)
+        with self._lock:
+            self._visual_target_id = target_id
+            self._visual_ready_at = now
+        return True
+
+    def _draw_visual(self, action: str, payload: dict[str, Any]) -> None:
+        try:
+            self._ensure_visual_overlay()
+            data = json.dumps(payload, ensure_ascii=False)
+            method = "move" if action == "move" else "click" if action == "click" else "wheel"
+            self.evaluate(f"""
+(() => {{
+  const payload = {data};
+  const api = window.__oabSyncVisual;
+  if (!api || typeof api.{method} !== 'function') return false;
+  return api.{method}(payload.x, payload.y);
+}})()
+""")
+        except Exception:
+            return
+
+
 class _FollowerWorker:
     def __init__(
         self,
         follower_id: str,
-        client_getter: Callable[[], CdpPageClient | None],
-        apply_handler: Callable[[CdpPageClient, str, dict[str, Any]], None],
+        client_getter: Callable[[], Any | None],
+        apply_handler: Callable[[Any, str, dict[str, Any]], None],
         error_handler: Callable[[str, Exception], None],
     ) -> None:
         self.follower_id = follower_id
@@ -679,7 +1325,10 @@ class _FollowerWorker:
                 items = [existing for existing in items if existing[0] != "mouse_move"]
                 items.append(item)
             elif event_type == "scroll":
-                items = [existing for existing in items if existing[0] not in {"scroll", "wheel"}]
+                if payload.get("source") == "wheel_calibrate":
+                    items = [existing for existing in items if existing[0] != "scroll"]
+                else:
+                    items = [existing for existing in items if existing[0] not in {"scroll", "wheel"}]
                 items.append(item)
             elif event_type == "wheel":
                 items = [existing for existing in items if existing[0] not in {"scroll", "mouse_move"}]
@@ -842,13 +1491,16 @@ class _SyncSession:
         self.last_error = ""
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._master_client: CdpPageClient | None = None
-        self._follower_clients: dict[str, CdpPageClient] = {}
+        self._master_poll_thread: threading.Thread | None = None
+        self._master_client: Any | None = None
+        self._follower_clients: dict[str, Any] = {}
         self._follower_workers: dict[str, _FollowerWorker] = {}
         self._master_target_ids: list[str] = []
         self._master_target_urls: dict[str, str] = {}
         self._master_active_target_id = ""
         self._recent_navigate_urls: deque[str] = deque(maxlen=6)
+        self._last_click_event_at = 0.0
+        self._deferred_new_target_ids: dict[str, bool] = {}
 
     @property
     def is_running(self) -> bool:
@@ -860,11 +1512,14 @@ class _SyncSession:
         self._refresh_master_target_snapshot()
         if self.options.get("sync_current_url_on_start"):
             self.sync_master_url_to_followers()
+        self._start_master_poll_thread()
         self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
+        if self._master_poll_thread and self._master_poll_thread.is_alive() and self._master_poll_thread is not threading.current_thread():
+            self._master_poll_thread.join(timeout=1)
         if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
             self._thread.join(timeout=2)
         self._close_all_clients()
@@ -953,9 +1608,11 @@ class _SyncSession:
         while not self._stop_event.wait(SYNC_HEARTBEAT_SECONDS):
             try:
                 self._ensure_clients(initial=False)
-                self._install_master_script()
                 if self._master_client:
+                    self._sync_master_current_target()
                     self._master_client.refresh_target()
+                self._install_master_script()
+                self._drain_master_poll_events()
                 self._sync_browser_ui_changes()
                 for client in self._follower_clients.values():
                     client.refresh_target()
@@ -994,19 +1651,21 @@ class _SyncSession:
 
     def _ensure_client(
         self,
-        existing: CdpPageClient | None,
+        existing: Any | None,
         profile_id: str,
         runtime: dict[str, Any],
         is_master: bool,
-    ) -> CdpPageClient:
+    ) -> Any:
         port = int(runtime.get("remote_debugging_port") or 0)
         if not port:
             raise RuntimeError(f"{self._profile_label(profile_id)} 没有可用的调试端口")
-        if existing and existing.port == port and existing.is_connected:
+        engine = str(runtime.get("engine") or (self._profile_resolver(profile_id) or {}).get("engine") or "chrome").strip().lower()
+        client_cls = RuyiFirefoxPageClient if engine == "firefox" else CdpPageClient
+        if existing and isinstance(existing, client_cls) and existing.port == port and existing.is_connected:
             return existing
         if existing:
             existing.close()
-        client = CdpPageClient(
+        client = client_cls(
             profile_id=profile_id,
             port=port,
             event_handler=self._handle_master_event if is_master else None,
@@ -1027,17 +1686,58 @@ class _SyncSession:
         self._follower_workers[follower_id] = worker
         worker.start()
 
+    def _start_master_poll_thread(self) -> None:
+        if not self._master_client or not hasattr(self._master_client, "drain_events"):
+            return
+        if self._master_poll_thread and self._master_poll_thread.is_alive():
+            return
+        self._master_poll_thread = threading.Thread(target=self._drain_master_poll_loop, daemon=True)
+        self._master_poll_thread.start()
+
+    def _drain_master_poll_loop(self) -> None:
+        while not self._stop_event.wait(SYNC_FIREFOX_POLL_SECONDS):
+            self._drain_master_poll_events()
+
+    def _sync_master_current_target(self) -> None:
+        if not self._master_client or not isinstance(self._master_client, RuyiFirefoxPageClient):
+            return
+        try:
+            self._master_client.sync_to_current_target()
+        except Exception as exc:
+            if not _is_missing_browsing_context_error(exc):
+                self._set_error(f"同步主窗口标签页失败：{exc}")
+
     def _install_master_script(self) -> None:
         if not self._master_client:
             return
+        self._sync_master_current_target()
         try:
             self._master_client.send("Runtime.addBinding", {"name": "__oabSyncBinding"})
         except Exception:
             pass
+        for attempt in range(2):
+            try:
+                self._master_client.evaluate(MASTER_INJECT_SCRIPT)
+                if self.last_error.startswith("同步脚本注入失败"):
+                    self._set_error("")
+                return
+            except Exception as exc:
+                if attempt == 0 and _is_missing_browsing_context_error(exc):
+                    self._sync_master_current_target()
+                    continue
+                self._set_error(f"同步脚本注入失败：{exc}")
+                return
+
+    def _drain_master_poll_events(self) -> None:
+        if not self._master_client or not hasattr(self._master_client, "drain_events"):
+            return
         try:
-            self._master_client.evaluate(MASTER_INJECT_SCRIPT)
+            events = self._master_client.drain_events()
         except Exception as exc:
-            self._set_error(f"同步脚本注入失败：{exc}")
+            self._set_error(f"读取同步事件失败：{exc}")
+            return
+        for event in events:
+            self._dispatch_master_event(event)
 
     def _refresh_master_target_snapshot(self) -> None:
         targets = self._list_master_targets()
@@ -1083,13 +1783,22 @@ class _SyncSession:
             for item in targets
             if item.get("id")
         }
-        active_target_id = current_ids[0] if current_ids else ""
         new_ids = [target_id for target_id in current_ids if target_id and target_id not in previous_ids]
+        active_target_id = _active_target_id_from_targets(targets)
+        if not active_target_id and new_ids:
+            active_target_id = new_ids[-1]
+        if not active_target_id:
+            active_target_id = current_ids[0] if current_ids else ""
 
+        resolved_deferred_target_ids: set[str] = set()
         if self.options.get("sync_browser_ui"):
             for target_id in new_ids:
+                target_url = current_urls.get(target_id, "")
+                if self._should_defer_new_tab(target_url):
+                    self._deferred_new_target_ids[target_id] = target_id == active_target_id
+                    continue
                 self._broadcast_browser_ui_event("browser_new_tab", {
-                    "url": current_urls.get(target_id, ""),
+                    "url": target_url,
                     "activate": target_id == active_target_id,
                 })
             if new_ids:
@@ -1107,11 +1816,30 @@ class _SyncSession:
                 self._broadcast_browser_ui_event("browser_activate_tab", {"url": active_url})
                 self._record_event("browser_activate_tab", {"url": active_url})
 
+            for target_id in list(self._deferred_new_target_ids.keys()):
+                if target_id not in current_ids:
+                    self._deferred_new_target_ids.pop(target_id, None)
+                    continue
+                target_url = current_urls.get(target_id, "")
+                if not _should_sync_browser_url(target_url):
+                    continue
+                activate = bool(self._deferred_new_target_ids.pop(target_id, False)) or target_id == active_target_id
+                self._broadcast_browser_ui_event("browser_new_tab", {
+                    "url": target_url,
+                    "activate": activate,
+                })
+                self._record_event("browser_new_tab", {"url": target_url, "count": 1})
+                resolved_deferred_target_ids.add(target_id)
+
         for target_id, url in current_urls.items():
             previous_url = previous_urls.get(target_id, "")
             if url == previous_url:
                 continue
             if target_id in new_ids:
+                continue
+            if target_id in self._deferred_new_target_ids:
+                continue
+            if target_id in resolved_deferred_target_ids:
                 continue
             if _should_sync_browser_url(url):
                 self._broadcast_navigation(url)
@@ -1131,6 +1859,13 @@ class _SyncSession:
         except Exception as exc:
             self._set_error(f"切换主控标签页失败：{exc}")
             return False
+
+    def _should_defer_new_tab(self, url: str) -> bool:
+        if _should_sync_browser_url(url):
+            return False
+        if not self._last_click_event_at:
+            return False
+        return (time.monotonic() - self._last_click_event_at) <= SYNC_CLICK_NEW_TAB_DEFER_SECONDS
 
     def _broadcast_browser_ui_event(self, event_type: str, payload: dict[str, Any]) -> None:
         for follower_id in self.follower_profile_ids:
@@ -1224,6 +1959,9 @@ class _SyncSession:
         if option_key and not self.options.get(option_key):
             return
 
+        if event_type == "click":
+            self._last_click_event_at = time.monotonic()
+
         for follower_id in self.follower_profile_ids:
             client = self._follower_clients.get(follower_id)
             if not client:
@@ -1238,7 +1976,7 @@ class _SyncSession:
                     self._handle_worker_error(follower_id, exc)
         self._record_event(event_type, payload)
 
-    def _apply_event_to_follower(self, client: CdpPageClient, event_type: str, payload: dict[str, Any]) -> None:
+    def _apply_event_to_follower(self, client: Any, event_type: str, payload: dict[str, Any]) -> None:
         if event_type == "browser_new_tab":
             self._open_follower_tab(client, payload)
             return
@@ -1297,7 +2035,7 @@ class _SyncSession:
             client.evaluate(_build_key_expression(payload))
             return
 
-    def _align_follower_target_for_payload(self, client: CdpPageClient, payload: dict[str, Any]) -> None:
+    def _align_follower_target_for_payload(self, client: Any, payload: dict[str, Any]) -> None:
         if not self.options.get("sync_browser_ui"):
             return
         page_url = str(payload.get("page_url") or "").strip()
@@ -1314,8 +2052,18 @@ class _SyncSession:
             pass
         client.switch_target(target_id)
 
-    def _open_follower_tab(self, client: CdpPageClient, payload: dict[str, Any]) -> None:
+    def _open_follower_tab(self, client: Any, payload: dict[str, Any]) -> None:
         requested_url = str(payload.get("url") or "").strip()
+        if _should_sync_browser_url(requested_url):
+            existing_target_id = self._find_matching_target_id(client, requested_url)
+            if existing_target_id:
+                if bool(payload.get("activate", True)):
+                    try:
+                        client.activate_target(existing_target_id)
+                    except Exception:
+                        pass
+                    client.switch_target(existing_target_id)
+                return
         create_url = self._new_tab_url_for_profile(client.profile_id, requested_url)
         activate = bool(payload.get("activate", True))
         try:
@@ -1331,7 +2079,7 @@ class _SyncSession:
                 pass
             client.switch_target(target_id)
 
-    def _activate_follower_tab(self, client: CdpPageClient, payload: dict[str, Any]) -> None:
+    def _activate_follower_tab(self, client: Any, payload: dict[str, Any]) -> None:
         target_id = self._find_matching_target_id(client, str(payload.get("url") or "").strip())
         if not target_id:
             return
@@ -1353,7 +2101,7 @@ class _SyncSession:
             return "chrome://newtab/"
         return url or "about:blank"
 
-    def _find_matching_target_id(self, client: CdpPageClient, target_url: str) -> str:
+    def _find_matching_target_id(self, client: Any, target_url: str) -> str:
         normalized_url = str(target_url or "").strip()
         if not normalized_url:
             return ""
@@ -1452,6 +2200,8 @@ class _SyncSession:
 
 
 def _decode_sync_event(raw_payload: Any) -> dict[str, Any] | None:
+    if isinstance(raw_payload, dict):
+        return raw_payload
     if not isinstance(raw_payload, str):
         return None
     value = raw_payload.strip()
@@ -1482,6 +2232,25 @@ def _should_sync_browser_url(url: str) -> bool:
 def _is_browser_blank_url(url: str) -> bool:
     value = str(url or "").strip().lower()
     return value in {"about:blank", "about:newtab", "chrome://newtab/", "chrome://new-tab-page/"}
+
+
+def _is_missing_browsing_context_error(exc: Exception | str) -> bool:
+    value = str(exc or "").strip().lower()
+    if not value:
+        return False
+    return (
+        "no such frame" in value
+        or ("browsing context" in value and "not found" in value)
+        or ("browsingcontext" in value and "not found" in value)
+        or ("context" in value and "discarded" in value)
+    )
+
+
+def _active_target_id_from_targets(targets: list[dict[str, Any]]) -> str:
+    for item in targets:
+        if isinstance(item, dict) and bool(item.get("active")):
+            return str(item.get("id") or "")
+    return ""
 
 
 def _mouse_modifiers(payload: dict[str, Any]) -> int:
@@ -1519,6 +2288,101 @@ def _build_wheel_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_smooth_wheel_expression(payload: dict[str, Any]) -> str:
+    data = json.dumps(payload, ensure_ascii=False)
+    return f"""
+(() => {{
+  const payload = {data};
+  const clamp = (value, max) => Math.max(0, Math.min(Math.round(Number(value || 0)), Math.max(0, max - 1)));
+  const x = clamp(payload.x, window.innerWidth);
+  const y = clamp(payload.y, window.innerHeight);
+  const deltaX = Number(payload.deltaX || 0);
+  const deltaY = Number(payload.deltaY || 0);
+  const canScroll = (node) => {{
+    if (!node || node.nodeType !== 1) return false;
+    const style = window.getComputedStyle(node);
+    const overflowY = style.overflowY || '';
+    const overflowX = style.overflowX || '';
+    const scrollY = /(auto|scroll|overlay)/.test(overflowY) && node.scrollHeight > node.clientHeight + 1;
+    const scrollX = /(auto|scroll|overlay)/.test(overflowX) && node.scrollWidth > node.clientWidth + 1;
+    return scrollY || scrollX;
+  }};
+  const findTarget = () => {{
+    let node = document.elementFromPoint(x, y);
+    while (node && node !== document.body && node !== document.documentElement) {{
+      if (canScroll(node)) return node;
+      node = node.parentElement;
+    }}
+    return window;
+  }};
+  const scrollTarget = findTarget();
+  const state = window.__oabSmoothWheel || (window.__oabSmoothWheel = {{
+    dx: 0,
+    dy: 0,
+    target: window,
+    running: false,
+    frame: 0,
+  }});
+  state.dx += deltaX;
+  state.dy += deltaY;
+  state.target = scrollTarget;
+
+  const applyScroll = (target, dx, dy) => {{
+    if (target === window) {{
+      window.scrollBy({{ left: dx, top: dy, behavior: 'auto' }});
+      return;
+    }}
+    target.scrollLeft += dx;
+    target.scrollTop += dy;
+  }};
+
+  const step = () => {{
+    const absX = Math.abs(state.dx);
+    const absY = Math.abs(state.dy);
+    if (absX < 0.5 && absY < 0.5) {{
+      state.dx = 0;
+      state.dy = 0;
+      state.running = false;
+      state.frame = 0;
+      return;
+    }}
+    const partX = absX < 1 ? state.dx : state.dx * 0.42;
+    const partY = absY < 1 ? state.dy : state.dy * 0.42;
+    state.dx -= partX;
+    state.dy -= partY;
+    applyScroll(state.target || window, partX, partY);
+    state.frame = requestAnimationFrame(step);
+  }};
+
+  try {{
+    const wheelTarget = scrollTarget === window ? (document.elementFromPoint(x, y) || document.body) : scrollTarget;
+    wheelTarget.dispatchEvent(new WheelEvent('wheel', {{
+      bubbles: true,
+      cancelable: true,
+      ruyi: true,
+      clientX: x,
+      clientY: y,
+      deltaX,
+      deltaY,
+      deltaMode: 0,
+      ctrlKey: !!payload.ctrlKey,
+      shiftKey: !!payload.shiftKey,
+      altKey: !!payload.altKey,
+      metaKey: !!payload.metaKey,
+    }}));
+  }} catch (error) {{
+    // ignore
+  }}
+
+  if (!state.running) {{
+    state.running = true;
+    state.frame = requestAnimationFrame(step);
+  }}
+  return true;
+}})()
+"""
+
+
 def _build_mouse_move_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "mouseMoved",
@@ -1537,6 +2401,14 @@ def _button_name(button: int) -> str:
         2: "right",
     }
     return mapping.get(int(button or 0), "left")
+
+
+def _button_index(button: str) -> int:
+    mapping = {
+        "middle": 1,
+        "right": 2,
+    }
+    return mapping.get(str(button or "left").strip().lower(), 0)
 
 
 def _button_mask(button: int) -> int:
@@ -1665,6 +2537,7 @@ def _build_click_expression(payload: dict[str, Any]) -> str:
     bubbles: true,
     cancelable: true,
     composed: true,
+    ruyi: true,
     view: window,
     clientX,
     clientY,
@@ -1701,13 +2574,17 @@ def _build_input_expression(payload: dict[str, Any]) -> str:
   target.focus?.();
   if (payload.tag === 'select') {{
     target.value = payload.value ?? '';
-    target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    target.dispatchEvent(new Event('change', {{ bubbles: true, ruyi: true }}));
     return true;
   }}
   if (payload.inputType === 'checkbox' || payload.inputType === 'radio') {{
     target.checked = !!payload.checked;
-    target.dispatchEvent(new Event('input', {{ bubbles: true }}));
-    target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    try {{
+      target.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: null, inputType: 'insertReplacementText', ruyi: true }}));
+    }} catch (error) {{
+      target.dispatchEvent(new Event('input', {{ bubbles: true, ruyi: true }}));
+    }}
+    target.dispatchEvent(new Event('change', {{ bubbles: true, ruyi: true }}));
     return true;
   }}
   if (target.isContentEditable) {{
@@ -1717,8 +2594,12 @@ def _build_input_expression(payload: dict[str, Any]) -> str:
   }} else {{
     return false;
   }}
-  target.dispatchEvent(new Event('input', {{ bubbles: true }}));
-  target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  try {{
+    target.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: payload.value ?? '', inputType: 'insertReplacementText', ruyi: true }}));
+  }} catch (error) {{
+    target.dispatchEvent(new Event('input', {{ bubbles: true, ruyi: true }}));
+  }}
+  target.dispatchEvent(new Event('change', {{ bubbles: true, ruyi: true }}));
   return true;
 }})()
 """
@@ -1789,6 +2670,7 @@ def _build_key_expression(payload: dict[str, Any]) -> str:
     metaKey: !!payload.metaKey,
     bubbles: true,
     cancelable: true,
+    ruyi: true,
   }};
   target.dispatchEvent(new KeyboardEvent('keydown', init));
   target.dispatchEvent(new KeyboardEvent('keyup', init));
